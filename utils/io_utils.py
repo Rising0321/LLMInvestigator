@@ -11,6 +11,12 @@ import numpy as np
 
 import networkx as nx
 
+from sklearn.metrics import (
+    r2_score,
+    mean_squared_error,
+    mean_absolute_error,
+    mean_absolute_percentage_error)
+
 city_names = ["New York City", "San Francisco", "Washington", "Chicago"]
 
 
@@ -27,16 +33,12 @@ def parse_edgelist_line(line):
 
 
 def load_access_street_view(city, value_path):
-    temp = os.listdir(f"/home/work/zhangruixing/LLM-Investigator/data/PBFGraph/{city_names[city]}/{value_path}/")
+    temp = os.listdir(f"/home/wangb/OpenVIRL/data/{city_names[city]}/")
 
     ava_indexs = []
 
     for item in temp:
-        if item.endswith(".edgelist"):
-            street_views = item.replace(".edgelist", ".npy")
-            if os.path.exists(
-                    f"/home/work/zhangruixing/LLM-Investigator/data/StreetView/{city_names[city]}/{value_path}/{street_views}"):
-                ava_indexs.append(item)
+        ava_indexs.append(item)
     return ava_indexs
 
 
@@ -132,3 +134,71 @@ def get_graph_and_images(index, city, value_path):
     print_bottom(sub_g, street_views, colors_edge, colors)
 
     return sub_g, street_views, images, start_point
+
+
+def get_graph_and_images_dual(index, city, value_path):
+    street_views = index.replace(".edgelist", ".npy")
+    sub_g = my_read_edge_list(
+        f"/home/work/zhangruixing/LLM-Investigator/data/PBFGraph/{city_names[city]}/{value_path}/{index}")
+    street_views = np.load(
+        f"/home/work/zhangruixing/LLM-Investigator/data/StreetView/{city_names[city]}/{value_path}/{street_views}")
+    colors = assign_color(street_views)
+    colors_edge = assign_edge_color(sub_g, street_views, colors)
+    images = read_images(street_views)
+    start_point = get_strat_point(sub_g)
+    print_bottom(sub_g, street_views, colors_edge, colors)
+
+    return sub_g, street_views, images
+
+
+def read_images_new(street_views):
+    images = {}
+    for idx, item in enumerate(street_views):
+        path = f"/home/work/zhangruixing/LLM-Investigator/data/StreetView/images/street_view_{int(item[0] + 1)}.jpg"
+        image = Image.open(path).convert('RGB')
+        images[item[0] + 1] = image
+    return images
+
+
+def get_images(index, city, value_path):
+    index = int(index)
+    root_path = f"/home/wangb/OpenVIRL/data/{city_names[city]}/{index}/images"
+    temp = os.listdir(root_path)
+
+    images = []
+
+    for idx, item in enumerate(temp):
+        path = f"{root_path}/{item}"
+        image = Image.open(path).convert('RGB')
+        images.append(image)
+
+    return None, images
+
+
+def load_task_data(city, value_path):
+    if value_path != "Both":
+        return np.load(f"/home/wangb/zhangrx/LLMInvestrigator/data/TaskData/{city_names[city]}/{value_path}.npy")
+    else:
+        temp1 = np.load(f"/home/wangb/zhangrx/LLMInvestrigator/data/TaskData/{city_names[city]}/Carbon.npy")
+        temp2 = np.load(f"/home/wangb/zhangrx/LLMInvestrigator/data/TaskData/{city_names[city]}/Population.npy")
+        return [temp1, temp2]
+
+
+# return np.load(f"/home/work/zhangruixing/LLM-Investigator/data/TaskData/{city_names[city]}/{value_path}.npy")
+
+
+def calc(phase, epoch, all_predicts, all_y, loss):
+    metrics = {}
+    if loss is not None:
+        metrics["loss"] = loss
+    metrics["mse"] = mean_squared_error(all_y, all_predicts)
+    metrics["r2"] = r2_score(all_y, all_predicts)
+    metrics["rmse"] = np.sqrt(metrics["mse"])
+    metrics["mae"] = mean_absolute_error(all_y, all_predicts)
+    metrics["mape"] = mean_absolute_percentage_error(all_y, all_predicts)
+
+    print(
+        f"{phase} Epoch: {epoch} "
+        + "\t".join([f"{k}: {round(v, 4):.4f}" for k, v in metrics.items()])
+    )
+    return metrics

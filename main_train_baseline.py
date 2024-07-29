@@ -1,3 +1,5 @@
+import argparse
+import random
 import sys
 import os
 import requests
@@ -7,86 +9,223 @@ import numpy as np
 
 import matplotlib.pyplot as plt
 from PIL import Image
+import torch.nn as nn
 
-import MAE.models_mae
+import baselines.MAE.models_mae
+from tqdm import tqdm
 
-# define the utils
+from baselines.MAE import models_vit, models_mae
+from data.datasets import DownStreamDataset
+from utils.io_utils import load_access_street_view, get_images, load_task_data, calc
 
-imagenet_mean = np.array([0.485, 0.456, 0.406])
-imagenet_std = np.array([0.229, 0.224, 0.225])
+
+class Linear(nn.Module):
+    def __init__(self, embed_dim, value_path):
+        super().__init__()
+        out_dim = 2 if value_path == "Both" else 1
+        self.project = nn.Linear(embed_dim, out_dim)
+
+    def forward(self, image_latent):
+        temp = torch.max(image_latent, 1)[0]
+        logits = self.project(temp)
+        return logits.squeeze(1)
 
 
 def prepare_model(chkpt_dir, arch='mae_vit_large_patch16'):
     # build model
-    model = getattr(MAE.models_mae, arch)()
+    model = models_vit.__dict__['vit_large_patch16'](
+        num_classes=1,
+        drop_path_rate=0.1,
+        global_pool=True
+    )
     # load model
     checkpoint = torch.load(chkpt_dir, map_location='cpu')
     msg = model.load_state_dict(checkpoint['model'], strict=False)
     print(msg)
     model = model.cuda()
+
+    # freeze all but the head
+    for _, p in model.named_parameters():
+        p.requires_grad = False
+
     return model
 
 
-def run_one_image(img, model):
-    x = torch.tensor(img)
+def train(model, criterion, optimizer, loader, args, epoch):
+    device = torch.device(args.gpu)
+    model.train()
+    all_predictions = []
+    all_truths = []
+    total_loss = 0.0
+    for images, y in loader:
+        images = images.to(device=device)
+        y = y.to(device=device).float()
 
-    # make it a batch-like
-    x = x.unsqueeze(dim=0)
-    x = torch.einsum('nhwc->nchw', x)
+        optimizer.zero_grad()
 
-    # run MAE
-    loss, y, mask = model(x.float(), mask_ratio=0.75)
-    y = model.unpatchify(y)
-    y = torch.einsum('nchw->nhwc', y).detach().cpu()
+        predicts = model(images)
 
-    # visualize the mask
-    mask = mask.detach()
-    mask = mask.unsqueeze(-1).repeat(1, 1, model.patch_embed.patch_size[0] ** 2 * 3)  # (N, H*W, p*p*3)
-    mask = model.unpatchify(mask)  # 1 is removing, 0 is keeping
-    mask = torch.einsum('nchw->nhwc', mask).detach().cpu()
+        # print(predicts.shape, y.shape)
+        loss = criterion(predicts, y)
+        total_loss += loss.item()
+        loss.backward()
 
-    x = torch.einsum('nchw->nhwc', x)
+        optimizer.step()
+        all_predictions.extend(predicts.cpu().detach().numpy())
+        all_truths.extend(y.cpu().detach().numpy())
 
-    # masked image
-    im_masked = x * (1 - mask)
-
-    # MAE reconstruction pasted with visible patches
-    im_paste = x * (1 - mask) + y * mask
-
-    # make the plt figure larger
-    plt.rcParams['figure.figsize'] = [24, 24]
-
-    plt.subplot(1, 4, 1)
-    show_image(x[0], "original")
-
-    plt.subplot(1, 4, 2)
-    show_image(im_masked[0], "masked")
-
-    plt.subplot(1, 4, 3)
-    show_image(y[0], "reconstruction")
-
-    plt.subplot(1, 4, 4)
-    show_image(im_paste[0], "reconstruction + visible")
-
-    plt.show()
+    return calc("Train", epoch, all_predictions, all_truths, total_loss / len(loader))
 
 
-# load image
-img = Image.open(requests.get(img_url, stream=True).raw)
-img = img.resize((224, 224))
-img = np.array(img) / 255.
+def evaluate(model, loader, args, epoch):
+    device = torch.device(args.gpu)
+    model.eval()
 
-assert img.shape == (224, 224, 3)
+    all_y, all_predicts = [], []
+    with torch.no_grad():
+        for images, y in loader:
+            images = images.to(device=device)
 
-# normalize by ImageNet mean and std
-img = img - imagenet_mean
-img = img / imagenet_std
+            y = y.to(device=device).float()
+
+            predicts = model(images)
+
+            all_y.append(y.cpu().numpy())
+            all_predicts.append(predicts.cpu().numpy())
+    all_y = np.concatenate(all_y)
+    all_predicts = np.concatenate(all_predicts)
+    return calc("Eval", epoch, all_predicts, all_y, None)
+
+
+def main(args):
+    # pip install timm==0.3.2
+    # todo: change timm to 1.0.7
+    os.makedirs(f"./log/{args.model}", exist_ok=True)
+    checkpoints_dir = f"./baselines/{args.model}/checkpoints/{args.save_name}.pt"
+    os.makedirs(f"./baselines/{args.model}/checkpoints/", exist_ok=True)
+
+    ava_indexs = load_access_street_view(args.city, args.value_path)
+
+    task_data = load_task_data(args.city, args.value_path)
+
+    print(task_data.shape)
+
+    image_dataset = []
+    for index in tqdm(ava_indexs[:10]):
+        street_views, images = get_images(index, args.city, args.value_path)
+        # print(index)
+        if args.value_path == "Both":
+            image_dataset.append([images, [task_data[0][int(index)][-1], task_data[1][int(index)][-1]]])
+        else:
+            image_dataset.append([images, task_data[int(index)][-1]])
+
+    # load model
+    chkpt_dir = 'baselines/MAE/mae_pretrain_vit_large.pth'
+    model = prepare_model(chkpt_dir, 'mae_vit_large_patch16')
+
+    # split the dataset into train and test
+    train_size = int(0.8 * len(image_dataset))
+    test_size = len(image_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(image_dataset, [train_size, test_size])
+    train_dataset = DownStreamDataset(train_dataset, model)
+    val_dataset = DownStreamDataset(val_dataset, model, train_dataset.mean, train_dataset.std)
+
+    # data loader
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    model = Linear(model.embed_dim, args.value_path).to(args.gpu)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    criterion = nn.MSELoss()
+
+    best_val = 123456789
+
+    for epoch in range(args.epoch):
+        train(model, criterion, optimizer, train_loader, args, epoch)
+        cur_metrics = evaluate(model, train_loader, args, epoch)
+        # evaluate(model, test_loader, args, "test")
+        checkpoint_dict = {
+            "epoch": epoch + 1,
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+        }
+        if cur_metrics['mse'] < best_val:
+            torch.save(
+                checkpoint_dict,
+                checkpoints_dir,
+            )
+            best_val = cur_metrics['mse']
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--save_name",
+        type=str,
+        default="test",
+        help="save_name",
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="MAE",
+        help="model name",
+    )
+
+    parser.add_argument(
+        "--city",
+        type=int,
+        default=0,
+        choices=[0, 1, 2, 3],  # ["New York City", "San Francisco", "Washington", "Chicago"]
+        help=""
+    )
+
+    parser.add_argument(
+        "--value_path",
+        type=str,
+        default="Both",
+        help="Carbon, Population, Both",
+    )
+
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=64,
+        help="batch_size",
+    )
+
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=100000,
+        help="num epochs",
+    )
+
+    parser.add_argument(
+        "--gpu",
+        type=str,
+        default="cuda:0",
+        help="device",
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default="1e-3",
+        help="lr",
+    )
+
+    args = parser.parse_args()
+
+    main(args)
+
+'''
+
 
 # load model
-chkpt_dir = 'MAE/mae_pretrain_vit_large'
-model_mae = prepare_model(chkpt_dir, 'mae_vit_large_patch16')
-
 # run on an image
-torch.manual_seed(2)
-print('MAE with pixel reconstruction:')
-run_one_image(img, model_mae)
+
+'''
